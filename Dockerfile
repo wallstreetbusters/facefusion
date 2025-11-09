@@ -12,7 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY handler.py /app/handler.py
 
 # Python deps: keep it light for now
-RUN pip install --no-cache-dir runpod requests facefusion
+RUN pip install --no-cache-dir runpod requests facefusion-core
+
 
 # Start the worker
 CMD ["python", "/app/handler.py"]
