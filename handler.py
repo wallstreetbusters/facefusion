@@ -6,8 +6,11 @@ def handler(event):
 
     if op == "version":
         try:
-            import facefusion
-            ver = getattr(facefusion, "__version__", "unknown")
+            try:
+                import facefusion as ff
+            except Exception:
+                import facefusion_core as ff
+            ver = getattr(ff, "__version__", "unknown")
             return {"status": "ok", "facefusion_version": ver}
         except Exception as e:
             return {"status": "error", "error": str(e)}
