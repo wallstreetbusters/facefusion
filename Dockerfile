@@ -1,11 +1,18 @@
 FROM python:3.9-slim
 
+ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
+# Minimal OS deps (curl for debugging; ffmpeg is useful later for video)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
 
+# App files
 COPY handler.py /app/handler.py
-RUN pip install --no-cache-dir runpod
 
+# Python deps: keep it light for now
+RUN pip install --no-cache-dir runpod requests facefusion
+
+# Start the worker
 CMD ["python", "/app/handler.py"]
