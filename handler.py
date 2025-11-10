@@ -30,7 +30,7 @@ DEFAULT_MODEL_URLS = [
 ]
 
 # ---------------------------------------------------------------------
-# Utilities (no heavy imports here)
+# Utilities (no heavy imports herre)
 # ---------------------------------------------------------------------
 
 def _sha256_of_file(file_path: str) -> str:
