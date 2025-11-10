@@ -1,173 +1,206 @@
+# handler.py
+# Runpod serverless entry that keeps top-level imports light.
+# Ops supported:
+#   - {"op": "health"}
+#   - {"op": "version"}
+#   - {"op": "download_models", "model_url": "<url or [urls]>", "force": false}
+#
+# Tip: Keep heavy imports INSIDE functions so health remains instant.
+
 import os
-import io
-import base64
-from typing import Tuple, Optional
-
+import time
+import json
+import hashlib
+import pathlib
+import urllib.request
 import runpod
-import requests
-import numpy as np
-import cv2
 
-# InsightFace (CPU) uses onnxruntime under the hood
-import insightface
-from insightface.app import FaceAnalysis
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
 
-MODELS_DIR = os.getenv("MODELS_DIR", "/app/models")
-INSWAPPER_NAME = "inswapper_128.onnx"
-INSWAPPER_PATH = os.path.join(MODELS_DIR, INSWAPPER_NAME)
+# Where to store models (change if you prefer a different persistent path).
+MODEL_DIR = os.environ.get("MODEL_DIR", "/workspace/models")
+pathlib.Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
 
-# A reliable default; you may override via input.model_url
-DEFAULT_INSWAPPER_URL = (
-    "https://huggingface.co/deepinsight/inswapper/resolve/main/inswapper_128.onnx"
-)
+# A sensible default model (commonly used for face swap pipelines).
+# Replace with your own mirror if needed.
+DEFAULT_MODEL_URLS = [
+    "https://huggingface.co/deepinsight/insightface/resolve/main/models/inswapper_128.onnx"
+]
 
-# ------------ helpers ------------
+# ---------------------------------------------------------------------
+# Utilities (no heavy imports here)
+# ---------------------------------------------------------------------
 
-def _ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+def _sha256_of_file(file_path: str) -> str:
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-def _download_file(url: str, dst_path: str):
-    _ensure_dir(os.path.dirname(dst_path))
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        with open(dst_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
 
-def _read_image_from_url(url: str) -> np.ndarray:
-    """Read an image URL into BGR ndarray (OpenCV)."""
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    data = np.frombuffer(resp.content, dtype=np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Unable to decode image.")
-    return img
+def _download_one(url: str, dest_dir: str, force: bool = False) -> dict:
+    """
+    Streams a single file from `url` into `dest_dir`.
+    Skips if already present (unless force=True).
+    Returns a dict with file metadata.
+    """
+    pathlib.Path(dest_dir).mkdir(parents=True, exist_ok=True)
+    filename = os.path.basename(url.split("?")[0].split("#")[0]) or f"model_{int(time.time())}"
+    dest_path = os.path.join(dest_dir, filename)
 
-def _b64_png(img: np.ndarray) -> str:
-    ok, buf = cv2.imencode(".png", img)
-    if not ok:
-        raise ValueError("Failed to encode result image.")
-    return base64.b64encode(buf.tobytes()).decode("utf-8")
+    if os.path.exists(dest_path) and not force:
+        return {
+            "url": url,
+            "path": dest_path,
+            "skipped": True,
+            "sha256": _sha256_of_file(dest_path),
+            "size": os.path.getsize(dest_path),
+        }
 
-# Lazy singletons (kept across requests in a warm pod)
-_FACE_APP: Optional[FaceAnalysis] = None
-_SWAPPER = None
-
-def _get_face_app() -> FaceAnalysis:
-    global _FACE_APP
-    if _FACE_APP is None:
-        app = FaceAnalysis(name="buffalo_l")
-        # ctx_id=0 for CPU, det_size is a good default
-        app.prepare(ctx_id=0, det_size=(640, 640))
-        _FACE_APP = app
-    return _FACE_APP
-
-def _get_swapper() -> "insightface.model_zoo.inswapper.InSwapFace":
-    global _SWAPPER
-    if _SWAPPER is None:
-        if not os.path.exists(INSWAPPER_PATH):
-            raise FileNotFoundError(
-                f"Swapper model not found at {INSWAPPER_PATH}. "
-                f"Run op='download_models' first."
-            )
-        _SWAPPER = insightface.model_zoo.get_model(INSWAPPER_PATH, download=False)
-    return _SWAPPER
-
-# ------------ ops ------------
-
-def op_version() -> dict:
-    """Report relevant library versions."""
-    out = {"status": "ok", "versions": {}}
+    # Stream to a temp file then move atomically.
+    tmp_path = dest_path + ".part"
     try:
-        out["versions"]["insightface"] = getattr(insightface, "__version__", "unknown")
-    except Exception as e:
-        out["versions"]["insightface_error"] = str(e)
-    try:
-        import onnxruntime  # noqa
-        import onnx  # noqa
-        out["versions"]["onnxruntime"] = getattr(onnxruntime, "__version__", "unknown")
-        out["versions"]["onnx"] = getattr(onnx, "__version__", "unknown")
-    except Exception as e:
-        out["versions"]["onnx/onnxruntime_error"] = str(e)
-    return out
+        with urllib.request.urlopen(url) as r, open(tmp_path, "wb") as out:
+            while True:
+                chunk = r.read(1024 * 256)
+                if not chunk:
+                    break
+                out.write(chunk)
+        os.replace(tmp_path, dest_path)
 
-def op_download_models(model_url: Optional[str]) -> dict:
-    """Download inswapper_128.onnx into /app/models."""
-    url = model_url or DEFAULT_INSWAPPER_URL
-    _ensure_dir(MODELS_DIR)
-    _download_file(url, INSWAPPER_PATH)
-    size = os.path.getsize(INSWAPPER_PATH)
+        return {
+            "url": url,
+            "path": dest_path,
+            "skipped": False,
+            "sha256": _sha256_of_file(dest_path),
+            "size": os.path.getsize(dest_path),
+        }
+    finally:
+        # Clean partial file on any error.
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _safe_import(name):
+    """
+    Import a module only when needed; return (version or 'not-installed').
+    Never raise to keep health and version ops safe.
+    """
+    try:
+        mod = __import__(name)
+        # cv2 has version in cv2.__version__
+        ver = getattr(mod, "__version__", None)
+        if ver is None and name == "cv2":
+            ver = getattr(mod, "__version__", "unknown")
+        return ver or "unknown"
+    except Exception:
+        return "not-installed"
+
+# ---------------------------------------------------------------------
+# Ops
+# ---------------------------------------------------------------------
+
+def op_health(_event):
+    """
+    Fast, dependency-free health.
+    """
+    return {"status": "ok", "uptime": int(time.time())}
+
+
+def op_version(_event):
+    """
+    Report versions of heavy libs without importing them at module import time.
+    """
+    versions = {
+        "numpy": _safe_import("numpy"),
+        "onnxruntime": _safe_import("onnxruntime"),
+        "opencv": _safe_import("cv2"),
+        "insightface": _safe_import("insightface"),
+        "python": f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}",
+        "api": "1",
+    }
+    return {"versions": versions}
+
+
+def op_download_models(event):
+    """
+    Download one or more model files.
+    Input:
+      {
+        "op": "download_models",
+        "model_url": "<string or [strings]>",
+        "force": false
+      }
+    """
+    payload = (event or {}).get("input") or {}
+    urls = payload.get("model_url") or DEFAULT_MODEL_URLS
+    if isinstance(urls, str):
+        urls = [urls]
+
+    force = bool(payload.get("force", False))
+
+    results = []
+    errors = []
+
+    for u in urls:
+        try:
+            results.append(_download_one(u, MODEL_DIR, force=force))
+        except Exception as e:
+            errors.append({"url": u, "error": str(e)})
+
     return {
-        "status": "ok",
-        "model_path": INSWAPPER_PATH,
-        "bytes": size,
-        "source": url,
+        "status": "ok" if not errors else "partial",
+        "dest": MODEL_DIR,
+        "downloaded": results,
+        "errors": errors,
     }
 
-def op_swap(source_url: str, target_url: str, face_index_source: int = 0, face_index_target: int = 0) -> dict:
+# (Optional) placeholder for later operations, kept light until you implement them.
+def op_not_implemented(event):
+    op = ((event or {}).get("input") or {}).get("op")
+    return {"error": f"operation '{op}' not implemented yet"}
+
+# ---------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------
+
+def run(event):
     """
-    Swap the first (or specified) face from source onto target.
-    Returns a base64 PNG.
+    Main op dispatcher. Keeps imports lazy by branching first.
     """
-    # Load images
-    src = _read_image_from_url(source_url)
-    tgt = _read_image_from_url(target_url)
+    input_obj = (event or {}).get("input") or {}
+    op = str(input_obj.get("op", "version")).lower()
 
-    # Detect faces
-    app = _get_face_app()
-    src_faces = app.get(src)
-    tgt_faces = app.get(tgt)
+    if op == "health":
+        return op_health(event)
 
-    if not src_faces:
-        raise ValueError("No face detected in source image.")
-    if not tgt_faces:
-        raise ValueError("No face detected in target image.")
+    if op == "version":
+        return op_version(event)
 
-    si = min(max(face_index_source, 0), len(src_faces) - 1)
-    ti = min(max(face_index_target, 0), len(tgt_faces) - 1)
+    if op == "download_models":
+        # Heavy libs are NOT needed for downloading; we keep this path light.
+        return op_download_models(event)
 
-    # Swap
-    swapper = _get_swapper()
-    result = swapper.get(
-        tgt, tgt_faces[ti], src_faces[si],
-        paste_back=True  # keep full target image with swapped face
-    )
+    # In the future, implement ops like "swap" and import heavy libs inside that branch:
+    # if op == "swap":
+    #     import numpy as np
+    #     import cv2
+    #     import onnxruntime as ort
+    #     import insightface
+    #     ...
+    #     return {...}
 
-    return {
-        "status": "ok",
-        "image_base64": _b64_png(result),
-        "source_face_index": si,
-        "target_face_index": ti,
-    }
+    return op_not_implemented(event)
 
-# ------------ runpod entry ------------
+# Expose a fast health endpoint to Runpod
+def health(_):
+    return op_health(_)
 
-def handler(event):
-    inp = event.get("input", {}) if isinstance(event, dict) else {}
-
-    op = inp.get("op", "echo")
-    try:
-        if op == "version":
-            return op_version()
-
-        if op == "download_models":
-            return op_download_models(inp.get("model_url"))
-
-        if op == "swap":
-            return op_swap(
-                source_url=inp["source_url"],
-                target_url=inp["target_url"],
-                face_index_source=int(inp.get("source_face", 0)),
-                face_index_target=int(inp.get("target_face", 0)),
-            )
-
-        # default echo
-        return {"status": "ok", "echo": inp, "message": "Endpoint is alive."}
-
-    except Exception as e:
-        # Always return JSON error, never crash the pod
-        return {"status": "error", "error": str(e)}
-
-runpod.serverless.start({"handler": handler})
+# Start serverless loop
+runpod.serverless.start({"health": health, "run": run})
